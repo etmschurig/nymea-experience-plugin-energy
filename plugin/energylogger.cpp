@@ -36,6 +36,7 @@
 #include <QElapsedTimer>
 #include <QPointer>
 #include <QUuid>
+#include <QTimeZone>
 
 #include <QLoggingCategory>
 Q_DECLARE_LOGGING_CATEGORY(dcEnergyExperience)
@@ -60,61 +61,132 @@ struct ThingTotals {
     double totalProduction = 0;
 };
 
+qint64 floorDiv(qint64 value, qint64 divisor)
+{
+    qint64 result = value / divisor;
+    if (value % divisor != 0 && value < 0) {
+        result--;
+    }
+    return result;
+}
+
+// Sample timestamps of the fixed length sample rates (1 min, 15 mins, 1 hour, 3 hours) are aligned to the
+// local wall clock (e.g. 3 hour samples at 00:00, 03:00, 06:00... local time), but they are calculated on
+// absolute time (msecs since epoch) and the UTC offset in effect. Calculating them with wall clock arithmetic
+// (QDateTime(date, time).addMSecs()) is ambiguous in the hour repeated when DST ends: Qt 6 resolves it to the
+// first occurrence, so the "next" sample ends up one hour in the past and the sampling loops never finish.
+
+// Returns the first point in time strictly after msecs at which the local wall clock shows a multiple of stepMSecs.
+qint64 nextAlignedMSecs(qint64 msecs, qint64 stepMSecs)
+{
+    const QTimeZone timeZone = QTimeZone::systemTimeZone();
+    qint64 from = msecs + 1;
+    forever {
+        const QDateTime fromDateTime = QDateTime::fromMSecsSinceEpoch(from);
+        const qint64 offset = timeZone.isValid() ? timeZone.offsetFromUtc(fromDateTime) * 1000LL : 0;
+        const qint64 candidate = (floorDiv(from + offset - 1, stepMSecs) + 1) * stepMSecs - offset;
+        if (!timeZone.isValid() || !timeZone.hasTransitions()) {
+            return candidate;
+        }
+        // The offset is valid until the next transition. If the candidate is not before it, start over from there.
+        const QDateTime transition = timeZone.nextTransition(fromDateTime).atUtc;
+        if (!transition.isValid() || transition.toMSecsSinceEpoch() > candidate) {
+            return candidate;
+        }
+        from = transition.toMSecsSinceEpoch();
+    }
+}
+
+// Returns the last point in time strictly before msecs at which the local wall clock shows a multiple of stepMSecs.
+qint64 previousAlignedMSecs(qint64 msecs, qint64 stepMSecs)
+{
+    const QTimeZone timeZone = QTimeZone::systemTimeZone();
+    qint64 to = msecs - 1;
+    forever {
+        const QDateTime toDateTime = QDateTime::fromMSecsSinceEpoch(to);
+        const qint64 offset = timeZone.isValid() ? timeZone.offsetFromUtc(toDateTime) * 1000LL : 0;
+        const qint64 candidate = floorDiv(to + offset, stepMSecs) * stepMSecs - offset;
+        if (!timeZone.isValid() || !timeZone.hasTransitions()) {
+            return candidate;
+        }
+        // The offset is valid since the previous transition. If the candidate is before it, start over from there.
+        const QDateTime transition = timeZone.previousTransition(QDateTime::fromMSecsSinceEpoch(to + 1)).atUtc;
+        if (!transition.isValid() || transition.toMSecsSinceEpoch() <= candidate) {
+            return candidate;
+        }
+        to = transition.toMSecsSinceEpoch() - 1;
+    }
+}
+
 QDateTime maintenanceNextSampleTimestamp(EnergyLogs::SampleRate sampleRate, const QDateTime &dateTime)
 {
-    QTime time = dateTime.time();
-    QDate date = dateTime.date();
-    QDateTime next;
+    QDate date = dateTime.toLocalTime().date();
     switch (sampleRate) {
     case EnergyLogs::SampleRateAny:
         return QDateTime();
     case EnergyLogs::SampleRate1Min:
-        time.setHMS(time.hour(), time.minute(), 0);
-        next = QDateTime(date, time).addMSecs(60 * 1000);
-        break;
     case EnergyLogs::SampleRate15Mins:
-        time.setHMS(time.hour(), time.minute() - (time.minute() % 15), 0);
-        next = QDateTime(date, time).addMSecs(15 * 60 * 1000);
-        break;
     case EnergyLogs::SampleRate1Hour:
-        time.setHMS(time.hour(), 0, 0);
-        next = QDateTime(date, time).addMSecs(60 * 60 * 1000);
-        break;
     case EnergyLogs::SampleRate3Hours:
-        time.setHMS(time.hour() - (time.hour() % 3), 0, 0);
-        next = QDateTime(date, time).addMSecs(3 * 60 * 60 * 1000);
-        if (next.time().hour() == 2) {
-            next = next.addMSecs(60 * 60 * 1000);
-        }
-        break;
+        return QDateTime::fromMSecsSinceEpoch(nextAlignedMSecs(dateTime.toMSecsSinceEpoch(), sampleRate * 60 * 1000LL));
     case EnergyLogs::SampleRate1Day:
-        next = QDateTime(date, QTime()).addDays(1);
         break;
     case EnergyLogs::SampleRate1Week:
         date = date.addDays(-date.dayOfWeek() + 1);
-        next = QDateTime(date, QTime()).addDays(7);
         break;
     case EnergyLogs::SampleRate1Month:
         date = date.addDays(-date.day() + 1);
-        next = QDateTime(date, QTime()).addMonths(1);
         break;
     case EnergyLogs::SampleRate1Year:
         date.setDate(date.year(), 1, 1);
-        next = QDateTime(date, QTime()).addYears(1);
         break;
     }
+
+    // Days, weeks, months and years start at local midnight. Those days may be 23 or 25 hours long,
+    // so step on the calendar and make sure we always move forward.
+    QDateTime next;
+    do {
+        switch (sampleRate) {
+        case EnergyLogs::SampleRate1Week:
+            date = date.addDays(7);
+            break;
+        case EnergyLogs::SampleRate1Month:
+            date = date.addMonths(1);
+            break;
+        case EnergyLogs::SampleRate1Year:
+            date = date.addYears(1);
+            break;
+        default:
+            date = date.addDays(1);
+            break;
+        }
+        next = date.startOfDay();
+    } while (next <= dateTime);
 
     return next;
 }
 
 QDateTime maintenanceCalculateSampleStart(const QDateTime &sampleEnd, EnergyLogs::SampleRate sampleRate, int sampleCount = 1)
 {
-    if (sampleRate == EnergyLogs::SampleRate1Month) {
-        return sampleEnd.addMonths(-sampleCount);
-    } else if (sampleRate == EnergyLogs::SampleRate1Year) {
-        return sampleEnd.addYears(-sampleCount);
+    switch (sampleRate) {
+    case EnergyLogs::SampleRateAny:
+        return sampleEnd;
+    case EnergyLogs::SampleRate1Day:
+        return sampleEnd.toLocalTime().addDays(-sampleCount);
+    case EnergyLogs::SampleRate1Week:
+        return sampleEnd.toLocalTime().addDays(-7 * sampleCount);
+    case EnergyLogs::SampleRate1Month:
+        return sampleEnd.toLocalTime().addMonths(-sampleCount);
+    case EnergyLogs::SampleRate1Year:
+        return sampleEnd.toLocalTime().addYears(-sampleCount);
+    default:
+        break;
     }
-    return sampleEnd.addMSecs(-(quint64)sampleCount * sampleRate * 60 * 1000);
+    if (sampleCount == 1) {
+        // A 3 hour sample spans 2 or 4 hours when the DST changes, start it at the previous aligned sample.
+        return QDateTime::fromMSecsSinceEpoch(previousAlignedMSecs(sampleEnd.toMSecsSinceEpoch(), sampleRate * 60 * 1000LL));
+    }
+    return sampleEnd.addMSecs(-(qint64)sampleCount * sampleRate * 60 * 1000);
 }
 
 QList<ThingId> maintenanceLoggedThings(QSqlDatabase &db)
@@ -315,10 +387,12 @@ bool maintenanceSamplePowerBalance(QSqlDatabase &db, EnergyLogs::SampleRate samp
         totalReturn = query.value("totalReturn").toDouble();
     }
     if (resultCount > 0) {
-        medianConsumption = medianConsumption * baseSampleRate / sampleRate;
-        medianProduction = medianProduction * baseSampleRate / sampleRate;
-        medianAcquisition = medianAcquisition * baseSampleRate / sampleRate;
-        medianStorage = medianStorage * baseSampleRate / sampleRate;
+        // Scale to the actual length of the sample: 3 hour samples, days and longer ones vary with DST and the calendar.
+        const double sampleMinutes = sampleStart.msecsTo(sampleEnd) / 60000.0;
+        medianConsumption = medianConsumption * baseSampleRate / sampleMinutes;
+        medianProduction = medianProduction * baseSampleRate / sampleMinutes;
+        medianAcquisition = medianAcquisition * baseSampleRate / sampleMinutes;
+        medianStorage = medianStorage * baseSampleRate / sampleMinutes;
     } else {
         query = QSqlQuery(db);
         query.prepare(QStringLiteral("SELECT * FROM powerBalance WHERE sampleRate = ? ORDER BY timestamp DESC LIMIT 1;"));
@@ -370,7 +444,9 @@ bool maintenanceSampleThingPower(QSqlDatabase &db, const ThingId &thingId, Energ
         totalProduction = query.value("totalProduction").toDouble();
     }
     if (resultCount > 0) {
-        medianCurrentPower = medianCurrentPower * baseSampleRate / sampleRate;
+        // Scale to the actual length of the sample: 3 hour samples, days and longer ones vary with DST and the calendar.
+        const double sampleMinutes = sampleStart.msecsTo(sampleEnd) / 60000.0;
+        medianCurrentPower = medianCurrentPower * baseSampleRate / sampleMinutes;
     } else {
         query = QSqlQuery(db);
         query.prepare(QStringLiteral("SELECT * FROM thingPower WHERE thingId = ? AND sampleRate = ? ORDER BY timestamp DESC LIMIT 1;"));
@@ -1436,12 +1512,7 @@ void EnergyLogger::scheduleNextSample(SampleRate sampleRate)
 
 QDateTime EnergyLogger::calculateSampleStart(const QDateTime &sampleEnd, SampleRate sampleRate, int sampleCount)
 {
-    if (sampleRate == SampleRate1Month) {
-        return sampleEnd.addMonths(-sampleCount);
-    } else if (sampleRate == SampleRate1Year) {
-        return sampleEnd.addYears(-sampleCount);
-    }
-    return sampleEnd.addMSecs(-(quint64)sampleCount * sampleRate * 60 * 1000);
+    return maintenanceCalculateSampleStart(sampleEnd, sampleRate, sampleCount);
 }
 
 void EnergyLogger::rectifySamples(SampleRate sampleRate, SampleRate baseSampleRate)
@@ -1529,51 +1600,11 @@ void EnergyLogger::rectifySamples(SampleRate sampleRate, SampleRate baseSampleRa
 
 QDateTime EnergyLogger::nextSampleTimestamp(SampleRate sampleRate, const QDateTime &dateTime)
 {
-    QTime time = dateTime.time();
-    QDate date = dateTime.date();
-    QDateTime next;
-    switch (sampleRate) {
-    case SampleRateAny:
+    if (sampleRate == SampleRateAny) {
         qCWarning(dcEnergyExperience()) << "Cannot calculate next sample timestamp without a sample rate";
         return QDateTime();
-    case SampleRate1Min:
-        time.setHMS(time.hour(), time.minute(), 0);
-        next = QDateTime(date, time).addMSecs(60 * 1000);
-        break;
-    case SampleRate15Mins:
-        time.setHMS(time.hour(), time.minute() - (time.minute() % 15), 0);
-        next = QDateTime(date, time).addMSecs(15 * 60 * 1000);
-        break;
-    case SampleRate1Hour:
-        time.setHMS(time.hour(), 0, 0);
-        next = QDateTime(date, time).addMSecs(60 * 60 * 1000);
-        break;
-    case SampleRate3Hours:
-        time.setHMS(time.hour() - (time.hour() % 3), 0, 0);
-        next = QDateTime(date, time).addMSecs(3 * 60 * 60 * 1000);
-        if (next.time().hour() == 2) {
-            qCDebug(dcEnergyExperience()) << "DST switch detected!";
-            next = next.addMSecs(60 * 60 * 1000);
-        }
-        break;
-    case SampleRate1Day:
-        next = QDateTime(date, QTime()).addDays(1);
-        break;
-    case SampleRate1Week:
-        date = date.addDays(-date.dayOfWeek() + 1);
-        next = QDateTime(date, QTime()).addDays(7);
-        break;
-    case SampleRate1Month:
-        date = date.addDays(-date.day() + 1);
-        next = QDateTime(date, QTime()).addMonths(1);
-        break;
-    case SampleRate1Year:
-        date.setDate(date.year(), 1, 1);
-        next = QDateTime(date, QTime()).addYears(1);
-        break;
     }
-
-    return next;
+    return maintenanceNextSampleTimestamp(sampleRate, dateTime);
 }
 
 bool EnergyLogger::samplePowerBalance(SampleRate sampleRate, SampleRate baseSampleRate, const QDateTime &sampleEnd)
@@ -1618,10 +1649,12 @@ bool EnergyLogger::samplePowerBalance(SampleRate sampleRate, SampleRate baseSamp
         totalReturn = query.value("totalReturn").toDouble();
     }
     if (resultCount > 0) {
-        medianConsumption = medianConsumption * baseSampleRate / sampleRate;
-        medianProduction = medianProduction * baseSampleRate / sampleRate;
-        medianAcquisition = medianAcquisition * baseSampleRate / sampleRate;
-        medianStorage = medianStorage * baseSampleRate / sampleRate;
+        // Scale to the actual length of the sample: 3 hour samples, days and longer ones vary with DST and the calendar.
+        const double sampleMinutes = sampleStart.msecsTo(sampleEnd) / 60000.0;
+        medianConsumption = medianConsumption * baseSampleRate / sampleMinutes;
+        medianProduction = medianProduction * baseSampleRate / sampleMinutes;
+        medianAcquisition = medianAcquisition * baseSampleRate / sampleMinutes;
+        medianStorage = medianStorage * baseSampleRate / sampleMinutes;
 
     } else {
         // If there are no base samples for the given time frame at all, let's try to find the last existing one in the base
@@ -1733,7 +1766,9 @@ bool EnergyLogger::sampleThingPower(const ThingId &thingId, SampleRate sampleRat
         totalProduction = query.value("totalProduction").toDouble();
     }
     if (resultCount > 0) {
-        medianCurrentPower = medianCurrentPower * baseSampleRate / sampleRate;
+        // Scale to the actual length of the sample: 3 hour samples, days and longer ones vary with DST and the calendar.
+        const double sampleMinutes = sampleStart.msecsTo(sampleEnd) / 60000.0;
+        medianCurrentPower = medianCurrentPower * baseSampleRate / sampleMinutes;
 
     } else {
         // If there are no base samples for the given time frame at all, let's try to find the last existing one in the base
