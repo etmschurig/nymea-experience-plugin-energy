@@ -200,6 +200,52 @@ bool maintenanceSampleAdvances(EnergyLogs::SampleRate sampleRate, const QDateTim
     return false;
 }
 
+// Older versions could write the same sample more than once (e.g. when the DST ended).
+// Keep the first written row of each sample and drop the others. Returns the number of removed rows, or -1 on error.
+int removeDuplicateSamples(QSqlDatabase &db)
+{
+    QSqlQuery checkQuery(db);
+    if (!checkQuery.exec(QStringLiteral("SELECT 1 FROM powerBalance GROUP BY sampleRate, timestamp HAVING COUNT(*) > 1 LIMIT 1;"))) {
+        qCWarning(dcEnergyExperience()) << "Failed to check powerBalance for duplicate samples:" << checkQuery.lastError();
+        return -1;
+    }
+    bool hasDuplicates = checkQuery.next();
+    if (!checkQuery.exec(QStringLiteral("SELECT 1 FROM thingPower GROUP BY thingId, sampleRate, timestamp HAVING COUNT(*) > 1 LIMIT 1;"))) {
+        qCWarning(dcEnergyExperience()) << "Failed to check thingPower for duplicate samples:" << checkQuery.lastError();
+        return -1;
+    }
+    hasDuplicates |= checkQuery.next();
+    if (!hasDuplicates) {
+        return 0;
+    }
+
+    db.transaction();
+    QSqlQuery powerBalanceQuery(db);
+    if (!powerBalanceQuery.exec(QStringLiteral("DELETE FROM powerBalance WHERE rowid NOT IN (SELECT MIN(rowid) FROM powerBalance GROUP BY sampleRate, timestamp);"))) {
+        qCWarning(dcEnergyExperience()) << "Failed to remove duplicate powerBalance samples:" << powerBalanceQuery.lastError();
+        db.rollback();
+        return -1;
+    }
+    // Note: numRowsAffected() reports the last statement on the connection, read it right away.
+    const int powerBalanceCount = powerBalanceQuery.numRowsAffected();
+    QSqlQuery thingPowerQuery(db);
+    if (!thingPowerQuery.exec(QStringLiteral("DELETE FROM thingPower WHERE rowid NOT IN (SELECT MIN(rowid) FROM thingPower GROUP BY thingId, sampleRate, timestamp);"))) {
+        qCWarning(dcEnergyExperience()) << "Failed to remove duplicate thingPower samples:" << thingPowerQuery.lastError();
+        db.rollback();
+        return -1;
+    }
+    const int thingPowerCount = thingPowerQuery.numRowsAffected();
+    if (!db.commit()) {
+        qCWarning(dcEnergyExperience()) << "Failed to commit removal of duplicate samples:" << db.lastError();
+        db.rollback();
+        return -1;
+    }
+
+    qCWarning(dcEnergyExperience()).nospace() << "Removed " << powerBalanceCount << " duplicate powerBalance and "
+                                              << thingPowerCount << " duplicate thingPower samples from the energy log.";
+    return powerBalanceCount + thingPowerCount;
+}
+
 QList<ThingId> maintenanceLoggedThings(QSqlDatabase &db)
 {
     QList<ThingId> ret;
@@ -1473,6 +1519,8 @@ bool EnergyLogger::initDB()
             return false;
         }
     }
+
+    removeDuplicateSamples(m_db);
 
     qCDebug(dcEnergyExperience()) << "Initialized logging DB successfully." << m_db.databaseName();
     return true;
