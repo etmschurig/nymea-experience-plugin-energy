@@ -189,6 +189,17 @@ QDateTime maintenanceCalculateSampleStart(const QDateTime &sampleEnd, EnergyLogs
     return sampleEnd.addMSecs(-(qint64)sampleCount * sampleRate * 60 * 1000);
 }
 
+// Guard for the resampling loops: they must never get stuck if a sample timestamp does not move forward.
+bool maintenanceSampleAdvances(EnergyLogs::SampleRate sampleRate, const QDateTime &current, const QDateTime &next)
+{
+    if (next.isValid() && next > current) {
+        return true;
+    }
+    qCWarning(dcEnergyExperience()) << "Next sample timestamp" << next.toString(Qt::ISODate) << "for sample rate" << sampleRate
+                                    << "does not advance past" << current.toString(Qt::ISODate) << ". Stopping resampling of this series.";
+    return false;
+}
+
 QList<ThingId> maintenanceLoggedThings(QSqlDatabase &db)
 {
     QList<ThingId> ret;
@@ -482,6 +493,9 @@ void maintenanceRectifySamples(QSqlDatabase &db, EnergyLogs::SampleRate sampleRa
 
     if (!newestSample.isNull() && maintenanceNextSampleTimestamp(sampleRate, newestSample) < nextScheduledSample) {
         QDateTime nextSample = maintenanceNextSampleTimestamp(sampleRate, newestSample.addMSecs(1000));
+        if (!maintenanceSampleAdvances(sampleRate, newestSample, nextSample)) {
+            return;
+        }
         maintenanceSamplePowerBalance(db, sampleRate, baseSampleRate, nextSample);
         newestSample = nextSample;
     }
@@ -499,6 +513,10 @@ void maintenanceRectifySamples(QSqlDatabase &db, EnergyLogs::SampleRate sampleRa
             return;
         }
         QDateTime nextSample = maintenanceNextSampleTimestamp(sampleRate, newestSample.addMSecs(1000));
+        if (!maintenanceSampleAdvances(sampleRate, newestSample, nextSample)) {
+            db.commit();
+            return;
+        }
         maintenanceInsertPowerBalance(db, nextSample, sampleRate, 0, 0, 0, 0, latest.totalConsumption, latest.totalProduction, latest.totalAcquisition, latest.totalReturn);
         newestSample = nextSample;
     }
@@ -521,6 +539,9 @@ void maintenanceRectifySamples(QSqlDatabase &db, EnergyLogs::SampleRate sampleRa
 
         if (!newestSample.isNull() && maintenanceNextSampleTimestamp(sampleRate, newestSample) < nextScheduledSample) {
             QDateTime nextSample = maintenanceNextSampleTimestamp(sampleRate, newestSample.addMSecs(1000));
+            if (!maintenanceSampleAdvances(sampleRate, newestSample, nextSample)) {
+                return;
+            }
             maintenanceSampleThingPower(db, thingId, sampleRate, baseSampleRate, nextSample);
             newestSample = nextSample;
         }
@@ -536,6 +557,10 @@ void maintenanceRectifySamples(QSqlDatabase &db, EnergyLogs::SampleRate sampleRa
                 return;
             }
             QDateTime nextSample = maintenanceNextSampleTimestamp(sampleRate, newestSample.addMSecs(1000));
+            if (!maintenanceSampleAdvances(sampleRate, newestSample, nextSample)) {
+                db.commit();
+                return;
+            }
             maintenanceInsertThingPower(db, nextSample, sampleRate, thingId, 0, latest.totalConsumption, latest.totalProduction);
             newestSample = nextSample;
         }
@@ -1133,6 +1158,7 @@ void EnergyLogger::sample()
     if (now >= m_nextSamples.value(SampleRate1Min)) {
         QDateTime sampleEnd = m_nextSamples.value(SampleRate1Min);
         QDateTime sampleStart = sampleEnd.addMSecs(-60 * 1000);
+        bool alreadyLogged = false;
 
         if (!deferDbWrites) {
             PowerBalanceLogEntry newestInDB = latestLogEntry(SampleRate1Min);
@@ -1142,6 +1168,9 @@ void EnergyLogger::sample()
                 qCWarning(dcEnergyExperience()).nospace() << "Clock skew detected. Scheduling background recovery job.";
                 startDbMaintenance("clock skew recovery", sampleStart);
                 deferDbWrites = true;
+            } else if (newestInDB.timestamp().isValid() && newestInDB.timestamp() >= sampleEnd) {
+                qCWarning(dcEnergyExperience()) << "Power balance sample for" << sampleEnd.toString(Qt::ISODate) << "already logged. Skipping it.";
+                alreadyLogged = true;
             }
         }
 
@@ -1190,9 +1219,12 @@ void EnergyLogger::sample()
         double totalReturn = newest.totalReturn();
 
         qCDebug(dcEnergyExperience()) << "Sampled power balance:" << SampleRate1Min << "🔥:" << medianConsumption << "🌞:" << medianProduction << "💵:" << medianAcquisition << "🔋:" << medianStorage << "Totals:" << "🔥:" << totalConsumption << "🌞:" << totalProduction << "💵↓:" << totalAcquisition << "💵↑:" << totalReturn;
-        insertPowerBalance(sampleEnd, SampleRate1Min, medianConsumption, medianProduction, medianAcquisition, medianStorage, totalConsumption, totalProduction, totalAcquisition, totalReturn);
+        if (!alreadyLogged) {
+            insertPowerBalance(sampleEnd, SampleRate1Min, medianConsumption, medianProduction, medianAcquisition, medianStorage, totalConsumption, totalProduction, totalAcquisition, totalReturn);
+        }
 
         foreach (const ThingId &thingId, m_thingsPowerLiveLogs.keys()) {
+            bool thingAlreadyLogged = false;
 
             if (!deferDbWrites) {
                 ThingPowerLogEntry newestInDB = latestLogEntry(SampleRate1Min, thingId);
@@ -1202,6 +1234,9 @@ void EnergyLogger::sample()
                     qCWarning(dcEnergyExperience()).nospace() << "Clock skew detected for thing power logs. Scheduling background recovery job.";
                     startDbMaintenance("clock skew recovery", sampleStart);
                     deferDbWrites = true;
+                } else if (newestInDB.timestamp().isValid() && newestInDB.timestamp() >= sampleEnd) {
+                    qCWarning(dcEnergyExperience()) << "Thing power sample for" << thingId.toString() << sampleEnd.toString(Qt::ISODate) << "already logged. Skipping it.";
+                    thingAlreadyLogged = true;
                 }
             }
 
@@ -1239,7 +1274,9 @@ void EnergyLogger::sample()
             double totalProduction = newest.totalProduction();
 
             qCDebug(dcEnergyExperience()) << "Sampled thing power for" << thingId << SampleRate1Min << "🔥/🌞:" << medianPower << "Totals:" << "🔥:" << totalConsumption << "🌞:" << totalProduction;
-            insertThingPower(sampleEnd, SampleRate1Min, thingId, medianPower, totalConsumption, totalProduction);
+            if (!thingAlreadyLogged) {
+                insertThingPower(sampleEnd, SampleRate1Min, thingId, medianPower, totalConsumption, totalProduction);
+            }
         }
     }
 
@@ -1272,6 +1309,11 @@ void EnergyLogger::sample()
                     }
                 }
                 return;
+            }
+
+            if (newestInDB.isValid() && newestInDB >= sampleTime) {
+                qCWarning(dcEnergyExperience()) << "Sample for" << sampleRate << sampleTime.toString(Qt::ISODate) << "already logged. Skipping it.";
+                continue;
             }
 
             samplePowerBalance(sampleRate, baseSampleRate, sampleTime);
@@ -1537,6 +1579,9 @@ void EnergyLogger::rectifySamples(SampleRate sampleRate, SampleRate baseSampleRa
     if (!newestSample.isNull() && nextSampleTimestamp(sampleRate, newestSample) < m_nextSamples[sampleRate]) {
         // regularly sample one sample as there may be some valid samples in the base series
         QDateTime nextSample = nextSampleTimestamp(sampleRate, newestSample.addMSecs(1000));
+        if (!maintenanceSampleAdvances(sampleRate, newestSample, nextSample)) {
+            return;
+        }
         samplePowerBalance(sampleRate, baseSampleRate, nextSample);
         newestSample = nextSample;
     }
@@ -1551,6 +1596,10 @@ void EnergyLogger::rectifySamples(SampleRate sampleRate, SampleRate baseSampleRa
     int count = 0;
     while (!newestSample.isNull() && nextSampleTimestamp(sampleRate, newestSample) < m_nextSamples[sampleRate]) {
         QDateTime nextSample = nextSampleTimestamp(sampleRate, newestSample.addMSecs(1000));
+        if (!maintenanceSampleAdvances(sampleRate, newestSample, nextSample)) {
+            m_db.commit();
+            return;
+        }
         insertPowerBalance(nextSample, sampleRate, 0, 0, 0, 0, latest.totalConsumption(), latest.totalProduction(), latest.totalAcquisition(), latest.totalReturn());
         newestSample = nextSample;
         count++;
@@ -1577,6 +1626,9 @@ void EnergyLogger::rectifySamples(SampleRate sampleRate, SampleRate baseSampleRa
         //        qCDebug(dcEnergyExperience()) << "T next scheduled sample:" << m_nextSamples.value(sampleRate).toString();
         if (!newestSample.isNull() && nextSampleTimestamp(sampleRate, newestSample) < m_nextSamples[sampleRate]) {
             QDateTime nextSample = nextSampleTimestamp(sampleRate, newestSample.addMSecs(1000));
+            if (!maintenanceSampleAdvances(sampleRate, newestSample, nextSample)) {
+                return;
+            }
             sampleThingPower(thingId, sampleRate, baseSampleRate, nextSample);
             newestSample = nextSample;
         }
@@ -1589,6 +1641,10 @@ void EnergyLogger::rectifySamples(SampleRate sampleRate, SampleRate baseSampleRa
         int count = 0;
         while (!newestSample.isNull() && nextSampleTimestamp(sampleRate, newestSample) < m_nextSamples[sampleRate]) {
             QDateTime nextSample = nextSampleTimestamp(sampleRate, newestSample.addMSecs(1000));
+            if (!maintenanceSampleAdvances(sampleRate, newestSample, nextSample)) {
+                m_db.commit();
+                return;
+            }
             insertThingPower(nextSample, sampleRate, thingId, 0, latest.totalConsumption(), latest.totalProduction());
             newestSample = nextSample;
             count++;
